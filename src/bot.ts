@@ -37,13 +37,12 @@ const activeMessageBySession = new Map<string, string>();
 const debugEvents = !!process.env.OPENCODE_DEBUG_EVENTS;
 const sessionTurnBySession = new Map<string, number>();
 const lastUserTextBySession = new Map<string, string>();
-const messageTurnByMessageId = new Map<string, number>();
 let lastChatId: number | undefined;
-const questionByPollId = new Map<
+const questionByCallbackId = new Map<
   string,
   { sessionId: string; questionId: string; options: string[]; callID?: string; messageID?: string }
 >();
-const pollIdByQuestionId = new Map<string, string>();
+const callbackKeyByQuestionId = new Map<string, string>();
 
 function isAllowedUserId(userId?: number): boolean {
   return typeof userId === "number" && userId === allowedUserId;
@@ -268,12 +267,25 @@ async function flushMessage(state: MessageState): Promise<void> {
     }
     return;
   }
+  const expandableEntity = state.done
+    ? undefined
+    : [
+        {
+          type: "expandable_blockquote",
+          offset: 0,
+          length: content.length,
+        },
+      ];
   try {
     if (!state.telegramMessageId) {
-      const sent = await bot.api.sendMessage(state.chatId, content);
+      const sent = await bot.api.sendMessage(state.chatId, content, {
+        entities: expandableEntity,
+      });
       state.telegramMessageId = sent.message_id;
     } else {
-      await bot.api.editMessageText(state.chatId, state.telegramMessageId, content);
+      await bot.api.editMessageText(state.chatId, state.telegramMessageId, content, {
+        entities: expandableEntity,
+      });
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -319,13 +331,9 @@ function getTurnForSession(sessionId: string): number {
   return sessionTurnBySession.get(sessionId) ?? 0;
 }
 
-function getMessageKey(messageId: string, sessionId: string): string {
-  const existingTurn = messageTurnByMessageId.get(messageId);
-  const turn = existingTurn ?? getTurnForSession(sessionId);
-  if (existingTurn === undefined) {
-    messageTurnByMessageId.set(messageId, turn);
-  }
-  return `${messageId}:${turn}`;
+function getMessageKey(_messageId: string, sessionId: string): string {
+  const turn = getTurnForSession(sessionId);
+  return `${sessionId}:turn:${turn}`;
 }
 
 function noteUserPrompt(sessionId: string, text: string): void {
@@ -537,31 +545,36 @@ async function sendQuestionPoll(payload: any): Promise<void> {
     300
   );
 
-  let pollOptions =
+  let optionLabels =
     options.length > 0 ? options.slice(0, 10) : [];
-  if (pollOptions.length < 2) {
-    pollOptions = pollOptions.length === 1
-      ? [pollOptions[0], "Cancel"]
+  if (optionLabels.length < 2) {
+    optionLabels = optionLabels.length === 1
+      ? [optionLabels[0], "Cancel"]
       : ["Yes", "No"];
   }
 
-  const normalizedOptions = pollOptions.map((value) => clampPollText(value, 100));
+  const normalizedOptions = optionLabels.map((value) => clampPollText(value, 100));
+  const questionText = clampPollText(prompt || "Question", 300);
+  const callbackKey = `${questionId}:${Date.now()}`;
 
-  const sent = await bot.api.sendPoll(chatId, prompt || "Question", normalizedOptions, {
-    is_anonymous: false,
-    allows_multiple_answers: allowsMultiple,
+  const keyboard = {
+    inline_keyboard: normalizedOptions.map((label, idx) => [
+      { text: label, callback_data: `${callbackKey}:${idx}` },
+    ]),
+  };
+
+  const sent = await bot.api.sendMessage(chatId, questionText, {
+    reply_markup: keyboard,
   });
 
-  if (sent.poll?.id) {
-    questionByPollId.set(sent.poll.id, {
-      sessionId,
-      questionId,
-      options: normalizedOptions,
-      callID,
-      messageID,
-    });
-    pollIdByQuestionId.set(questionId, sent.poll.id);
-  }
+  questionByCallbackId.set(callbackKey, {
+    sessionId,
+    questionId,
+    options: normalizedOptions,
+    callID,
+    messageID,
+  });
+  callbackKeyByQuestionId.set(questionId, callbackKey);
 }
 
 function handleOpenCodeEvent(evt: OpenCodeEvent): void {
@@ -594,10 +607,29 @@ function handleOpenCodeEvent(evt: OpenCodeEvent): void {
       payload?.info?.questionId ??
       payload?.info?.id;
     if (questionId) {
-      const pollId = pollIdByQuestionId.get(questionId);
-      if (pollId) {
-        questionByPollId.delete(pollId);
-        pollIdByQuestionId.delete(questionId);
+      const callbackKey = callbackKeyByQuestionId.get(questionId);
+      if (callbackKey) {
+        questionByCallbackId.delete(callbackKey);
+        callbackKeyByQuestionId.delete(questionId);
+      }
+    }
+    return;
+  }
+  if (eventName === "question.replied") {
+    const questionId =
+      payload?.requestID ??
+      payload?.questionID ??
+      payload?.questionId ??
+      payload?.id ??
+      payload?.info?.requestID ??
+      payload?.info?.questionID ??
+      payload?.info?.questionId ??
+      payload?.info?.id;
+    if (questionId) {
+      const callbackKey = callbackKeyByQuestionId.get(questionId);
+      if (callbackKey) {
+        questionByCallbackId.delete(callbackKey);
+        callbackKeyByQuestionId.delete(questionId);
       }
     }
     return;
@@ -870,49 +902,50 @@ bot.on("message:text", async (ctx) => {
   }
 });
 
-bot.on("poll_answer", async (ctx) => {
-  if (!isAllowedUserId(ctx.update.poll_answer?.user?.id)) {
-    console.log(
-      `Blocked unauthorized poll answer from ${ctx.update.poll_answer?.user?.id ?? "unknown"}`
-    );
+bot.on("callback_query:data", async (ctx) => {
+  if (!isAllowedUserId(ctx.from?.id)) {
+    console.log(`Blocked unauthorized callback from ${ctx.from?.id ?? "unknown"}`);
     return;
   }
-  const pollAnswer = ctx.update.poll_answer;
-  const pollId = pollAnswer?.poll_id;
-  console.log(
-    `Poll answer received: pollId=${pollId ?? "unknown"} user=${pollAnswer?.user?.id ?? "unknown"}`
-  );
-  if (!pollId) return;
-  const question = questionByPollId.get(pollId);
-  if (!question) return;
-  console.log(
-    `Poll answer matched question ${question.questionId} for session ${question.sessionId}`
-  );
 
-  const selections = pollAnswer.option_ids ?? [];
-  const chosenLabels = selections
-    .map((idx) => question.options[idx])
-    .filter((value): value is string => typeof value === "string");
+  const data = ctx.callbackQuery.data ?? "";
+  const parts = data.split(":");
+  if (parts.length < 2) return;
+  const optionIndex = Number(parts[parts.length - 1]);
+  const callbackKey = parts.slice(0, -1).join(":");
+  const question = questionByCallbackId.get(callbackKey);
+  console.log(
+    `Inline answer received: callbackKey=${callbackKey} option=${optionIndex}`
+  );
+  if (!question || Number.isNaN(optionIndex)) return;
 
-  const answer =
-    chosenLabels.length === 1 ? chosenLabels[0] : chosenLabels;
+  const label = question.options[optionIndex];
+  if (!label) return;
 
   try {
     console.log(
-      `Sending poll answer to OpenCode: questionId=${question.questionId} selections=${selections.join(",")}`
+      `Sending inline answer to OpenCode: questionId=${question.questionId} option=${optionIndex}`
     );
-    await answerQuestion(question.sessionId, question.questionId, answer, selections, {
+    noteUserPrompt(question.sessionId, label);
+    await answerQuestion(question.sessionId, question.questionId, label, [optionIndex], {
       callID: question.callID,
       messageID: question.messageID,
     });
-    questionByPollId.delete(pollId);
-    console.log(`OpenCode question answered: questionId=${question.questionId}`);
+    questionByCallbackId.delete(callbackKey);
+    callbackKeyByQuestionId.delete(question.questionId);
+    await ctx.answerCallbackQuery({ text: "Answer sent." });
+    const msg = ctx.callbackQuery.message;
+    if (msg && "chat" in msg && "message_id" in msg) {
+      await ctx.api.editMessageReplyMarkup(msg.chat.id, msg.message_id, {
+        inline_keyboard: [],
+      });
+      await ctx.api.sendMessage(msg.chat.id, label);
+    }
   } catch (err) {
     console.error("Failed to answer OpenCode question:", err);
-    const fallbackText =
-      typeof answer === "string" ? answer : answer.join(", ");
+    await ctx.answerCallbackQuery({ text: "Failed to send answer." });
     try {
-      await sendPromptAsync(question.sessionId, [{ type: "text", text: fallbackText }]);
+      await sendPromptAsync(question.sessionId, [{ type: "text", text: label }]);
       console.log("Sent fallback answer as text to OpenCode.");
     } catch (fallbackErr) {
       console.error("Failed to send fallback answer as text:", fallbackErr);
