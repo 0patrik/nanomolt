@@ -12,7 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -269,6 +269,18 @@ function startOpenCodeServer(): void {
   spawnInApp(cmd, logCmd);
 }
 
+function stopOpenCodeServer(): boolean {
+  console.log("Stopping OpenCode server...");
+  if (process.platform === "win32") {
+    const res = spawnSync("taskkill", ["/IM", "opencode.exe", "/T", "/F"], {
+      stdio: "ignore",
+    });
+    return res.status === 0;
+  }
+  const res = spawnSync("pkill", ["-f", "opencode serve"], { stdio: "ignore" });
+  return res.status === 0;
+}
+
 async function waitForOpenCodeHealthy(): Promise<boolean> {
   const deadline = Date.now() + opencodeHealthTimeoutMs;
   const url = `${opencodeAttachUrl}${opencodeHealthPath}`;
@@ -411,6 +423,33 @@ bot.command("stop", async (ctx) => {
   } catch (err) {
     console.error("Failed to stop session:", err);
     await ctx.reply("Failed to stop session. Check server logs.");
+  }
+});
+
+// /killswitch suspends the OpenCode session and stops the OpenCode server.
+bot.command("killswitch", async (ctx) => {
+  if (!ensureAllowed(ctx)) return;
+  const chatId = ctx.chat?.id;
+  if (!chatId) return;
+  const sessionId = sessionByChat.get(chatId);
+  try {
+    if (sessionId) {
+      await abortSession(sessionId);
+    }
+  } catch (err) {
+    console.error("Failed to abort session on /killswitch:", err);
+  }
+
+  try {
+    const stopped = stopOpenCodeServer();
+    await ctx.reply(
+      stopped
+        ? "Killed OpenCode session and server."
+        : "Killed OpenCode session. Server stop command did not report success."
+    );
+  } catch (err) {
+    console.error("Failed to stop OpenCode server on /killswitch:", err);
+    await ctx.reply("Killed OpenCode session. Server stop failed; check logs.");
   }
 });
 
