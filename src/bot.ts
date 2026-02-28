@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
+import { spawn } from "node:child_process";
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -43,6 +44,26 @@ const questionByCallbackId = new Map<
   { sessionId: string; questionId: string; options: string[]; callID?: string; messageID?: string }
 >();
 const callbackKeyByQuestionId = new Map<string, string>();
+const attachedSessions = new Set<string>();
+const pendingAttachSessions = new Set<string>();
+const opencodeBin = process.env.OPENCODE_BIN || "opencode";
+const opencodeAttachUrl =
+  process.env.OPENCODE_URL?.replace(/\/$/, "") || "http://127.0.0.1:4096";
+const opencodeAttachMode = process.env.OPENCODE_ATTACH_MODE || "window";
+const opencodeAttachApp = process.env.OPENCODE_ATTACH_APP || "Terminal";
+const opencodeHome =
+  process.env.OPENCODE_HOME || path.join(process.cwd(), "opencode_home");
+const ghosttyExecFlag = process.env.OPENCODE_GHOSTTY_EXEC_FLAG || "-e";
+const ghosttyTabFlag = process.env.OPENCODE_GHOSTTY_TAB_FLAG || "--new-tab";
+const opencodeHealthPath = "/global/health";
+const opencodeHealthTimeoutMs = 15000;
+const opencodeHealthIntervalMs = 250;
+const attachDelayMs = 200;
+const attachRetryDelayMs = 500;
+const attachMaxRetries = 2;
+let opencodeServeStarted = false;
+let attachQueue: Promise<void> = Promise.resolve();
+let opencodeHealthPromise: Promise<boolean> | undefined;
 
 function isAllowedUserId(userId?: number): boolean {
   return typeof userId === "number" && userId === allowedUserId;
@@ -72,6 +93,164 @@ type MessageState = {
 
 const messageStates = new Map<string, MessageState>();
 
+function spawnInApp(cmd: string): void {
+  console.log(
+    `Launching opencode command in ${opencodeAttachApp} (mode=${opencodeAttachMode}): ${cmd}`
+  );
+  if (opencodeAttachMode === "open") {
+    const child = spawn("open", ["-a", opencodeAttachApp, "--args", ghosttyExecFlag, cmd], {
+      stdio: "ignore",
+      detached: true,
+    });
+    child.on("error", (err) => {
+      console.error("Failed to launch via open:", err);
+    });
+    child.unref();
+    return;
+  }
+
+  if (opencodeAttachMode === "tab" && opencodeAttachApp === "Ghostty") {
+    const child = spawn(
+      "open",
+      ["-a", opencodeAttachApp, "--args", ghosttyTabFlag, ghosttyExecFlag, cmd],
+      {
+        stdio: "ignore",
+        detached: true,
+      }
+    );
+    child.on("error", (err) => {
+      console.error("Failed to launch Ghostty tab:", err);
+    });
+    child.unref();
+    return;
+  }
+
+  const escaped = cmd.replace(/"/g, '\\"');
+  const script =
+    opencodeAttachMode === "tab" && opencodeAttachApp === "Terminal"
+      ? `tell application "Terminal"
+        activate
+        if (count of windows) = 0 then
+          do script "${escaped}"
+        else
+          do script "${escaped}" in front window
+        end if
+      end tell`
+      : opencodeAttachMode === "tab"
+        ? `tell application "${opencodeAttachApp}" to do script "${escaped}" in front window`
+        : opencodeAttachApp === "Terminal"
+          ? `tell application "Terminal"
+        if (count of windows) = 0 then
+          do script "${escaped}"
+        else
+          set frontWindow to window 1
+          set frontTab to selected tab of frontWindow
+          if busy of frontTab is false then
+            do script "${escaped}" in frontWindow
+          else
+            do script "${escaped}"
+          end if
+        end if
+      end tell`
+          : `tell application "${opencodeAttachApp}" to do script "${escaped}"`;
+  const child = spawn("osascript", ["-e", script], {
+    stdio: "ignore",
+    detached: true,
+  });
+  child.on("error", (err) => {
+    console.error("Failed to launch via osascript:", err);
+  });
+  child.unref();
+}
+
+function attachOpenCodeSession(sessionId: string): void {
+  if (attachedSessions.has(sessionId)) return;
+  attachedSessions.add(sessionId);
+  const cmd = `${opencodeBin} attach ${opencodeAttachUrl} --session ${sessionId}`;
+  try {
+    spawnInApp(cmd);
+  } catch (err) {
+    console.error("Failed to launch attach via configured mode; falling back to Terminal window.", err);
+    const fallbackScript = `tell application "Terminal"
+      activate
+      do script "${cmd.replace(/"/g, '\\"')}"
+    end tell`;
+    const child = spawn("osascript", ["-e", fallbackScript], {
+      stdio: "ignore",
+      detached: true,
+    });
+    child.unref();
+  }
+}
+
+function scheduleAttachDrain(): void {
+  attachQueue = attachQueue
+    .then(async () => {
+      if (!opencodeHealthPromise) return;
+      const isHealthy = await opencodeHealthPromise;
+      if (!isHealthy) return;
+      const sessions = Array.from(pendingAttachSessions);
+      if (sessions.length === 0) return;
+      pendingAttachSessions.clear();
+      await attachSessionsSequentially(sessions);
+    })
+    .catch((err) => {
+      console.error("Failed while attaching OpenCode sessions:", err);
+    });
+}
+
+function queueAttachSession(sessionId: string): void {
+  if (attachedSessions.has(sessionId)) return;
+  pendingAttachSessions.add(sessionId);
+  scheduleAttachDrain();
+}
+
+function startOpenCodeServer(): void {
+  if (opencodeServeStarted) return;
+  opencodeServeStarted = true;
+  if (!fs.existsSync(opencodeHome)) {
+    console.log(`OpenCode home not found at ${opencodeHome}; skipping opencode serve.`);
+    return;
+  }
+  const cmd = `cd ${JSON.stringify(opencodeHome)} && ${opencodeBin} serve`;
+  spawnInApp(cmd);
+}
+
+async function waitForOpenCodeHealthy(): Promise<boolean> {
+  const deadline = Date.now() + opencodeHealthTimeoutMs;
+  const url = `${opencodeAttachUrl}${opencodeHealthPath}`;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url);
+      if (res.ok) return true;
+    } catch {
+      // ignore and retry
+    }
+    await new Promise((resolve) => setTimeout(resolve, opencodeHealthIntervalMs));
+  }
+  return false;
+}
+
+async function attachSessionsSequentially(sessionIds: string[]): Promise<void> {
+  for (const sessionId of sessionIds) {
+    let attempts = 0;
+    while (attempts <= attachMaxRetries) {
+      try {
+        attachOpenCodeSession(sessionId);
+        break;
+      } catch (err) {
+        attempts += 1;
+        if (attempts > attachMaxRetries) {
+          console.error(`Failed to attach OpenCode for session ${sessionId}:`, err);
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, attachRetryDelayMs));
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, attachDelayMs));
+  }
+}
+
 function loadSessionsFromDisk(): void {
   if (!fs.existsSync(sessionStorePath)) return;
   try {
@@ -79,12 +258,17 @@ function loadSessionsFromDisk(): void {
     const data = JSON.parse(raw) as { chatId: number; sessionId: string }[];
     sessionByChat.clear();
     chatBySession.clear();
+    const sessions: string[] = [];
     for (const entry of data) {
       if (!entry || typeof entry.chatId !== "number" || typeof entry.sessionId !== "string") {
         continue;
       }
       sessionByChat.set(entry.chatId, entry.sessionId);
       chatBySession.set(entry.sessionId, entry.chatId);
+      sessions.push(entry.sessionId);
+    }
+    for (const sessionId of sessions) {
+      queueAttachSession(sessionId);
     }
     console.log(`Loaded ${sessionByChat.size} sessions from disk`);
   } catch (err) {
@@ -140,6 +324,7 @@ async function resetSessionForChat(chatId: number): Promise<string> {
   } catch (err) {
     console.error("Failed to initialize OpenCode session:", err);
   }
+  queueAttachSession(session.id);
   return session.id;
 }
 
@@ -189,6 +374,7 @@ async function getSessionForChat(chatId: number): Promise<string> {
   } catch (err) {
     console.error("Failed to initialize OpenCode session:", err);
   }
+  queueAttachSession(session.id);
   return session.id;
 }
 
@@ -1000,12 +1186,23 @@ try {
   process.exit(1);
 }
 
-loadSessionsFromDisk();
-
-console.log("Connecting to OpenCode event stream...");
-startEventStream(handleOpenCodeEvent).catch((err) => {
-  console.error("Failed to start OpenCode event stream:", err);
+startOpenCodeServer();
+opencodeHealthPromise = waitForOpenCodeHealthy().then((isHealthy) => {
+  if (!isHealthy) {
+    console.error("OpenCode server did not become healthy in time; skipping session attaches.");
+  }
+  return isHealthy;
 });
+loadSessionsFromDisk();
+scheduleAttachDrain();
+
+const opencodeHealthy = await (opencodeHealthPromise ?? Promise.resolve(false));
+if (opencodeHealthy) {
+  console.log("Connecting to OpenCode event stream...");
+  startEventStream(handleOpenCodeEvent).catch((err) => {
+    console.error("Failed to start OpenCode event stream:", err);
+  });
+}
 
 bot.start({
   onStart: (info) => console.log(`Bot @${info.username} is polling for updates`),
