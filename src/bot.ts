@@ -19,6 +19,13 @@ if (!token) {
   process.exit(1);
 }
 
+const allowedUserIdRaw = process.env.ALLOWED_USER_ID;
+const allowedUserId = allowedUserIdRaw ? Number(allowedUserIdRaw) : undefined;
+if (!allowedUserId || Number.isNaN(allowedUserId)) {
+  console.error("ALLOWED_USER_ID environment variable is required");
+  process.exit(1);
+}
+
 console.log("Creating bot instance...");
 const bot = new Bot(token);
 
@@ -37,6 +44,20 @@ const questionByPollId = new Map<
   { sessionId: string; questionId: string; options: string[]; callID?: string; messageID?: string }
 >();
 const pollIdByQuestionId = new Map<string, string>();
+
+function isAllowedUserId(userId?: number): boolean {
+  return typeof userId === "number" && userId === allowedUserId;
+}
+
+function ensureAllowed(ctx: Context): boolean {
+  const userId = ctx.from?.id;
+  if (!isAllowedUserId(userId)) {
+    console.log(`Blocked unauthorized user ${userId ?? "unknown"}`);
+    void ctx.reply("Unauthorized.");
+    return false;
+  }
+  return true;
+}
 
 type MessageState = {
   messageId: string;
@@ -93,6 +114,7 @@ bot.catch((err) => {
 });
 
 bot.command("start", async (ctx) => {
+  if (!ensureAllowed(ctx)) return;
   console.log(`/start command from user ${ctx.from?.id} (@${ctx.from?.username})`);
   const chatId = ctx.chat?.id;
   if (chatId) {
@@ -124,6 +146,7 @@ async function resetSessionForChat(chatId: number): Promise<string> {
 
 // /reset resets the OpenCode session for this chat.
 bot.command("reset", async (ctx) => {
+  if (!ensureAllowed(ctx)) return;
   const chatId = ctx.chat?.id;
   if (!chatId) return;
   try {
@@ -137,6 +160,7 @@ bot.command("reset", async (ctx) => {
 
 // /stop interrupts the current OpenCode session for this chat.
 bot.command("stop", async (ctx) => {
+  if (!ensureAllowed(ctx)) return;
   const chatId = ctx.chat?.id;
   if (!chatId) return;
   const sessionId = sessionByChat.get(chatId);
@@ -806,24 +830,28 @@ async function handleAudio(ctx: Context, fileId: string) {
 }
 
 bot.on("message:voice", (ctx) => {
+  if (!ensureAllowed(ctx)) return;
   console.log("Voice message received");
   lastChatId = ctx.chat?.id;
   return handleAudio(ctx, ctx.message.voice.file_id);
 });
 
 bot.on("message:audio", (ctx) => {
+  if (!ensureAllowed(ctx)) return;
   console.log("Audio file received");
   lastChatId = ctx.chat?.id;
   return handleAudio(ctx, ctx.message.audio.file_id);
 });
 
 bot.on("message:video_note", (ctx) => {
+  if (!ensureAllowed(ctx)) return;
   console.log("Video note received");
   lastChatId = ctx.chat?.id;
   return handleAudio(ctx, ctx.message.video_note.file_id);
 });
 
 bot.on("message:text", async (ctx) => {
+  if (!ensureAllowed(ctx)) return;
   const text = ctx.message.text;
   if (text.startsWith("/")) return;
   console.log(`Text message from user ${ctx.from?.id}: "${text.slice(0, 80)}"`);
@@ -843,6 +871,12 @@ bot.on("message:text", async (ctx) => {
 });
 
 bot.on("poll_answer", async (ctx) => {
+  if (!isAllowedUserId(ctx.update.poll_answer?.user?.id)) {
+    console.log(
+      `Blocked unauthorized poll answer from ${ctx.update.poll_answer?.user?.id ?? "unknown"}`
+    );
+    return;
+  }
   const pollAnswer = ctx.update.poll_answer;
   const pollId = pollAnswer?.poll_id;
   console.log(
