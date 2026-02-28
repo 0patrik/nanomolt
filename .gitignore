@@ -4,3 +4,5 @@ dist
 sessions.json
 .claude
 .DS_Store
+opencode_home/*
+!opencode_home/agents.md

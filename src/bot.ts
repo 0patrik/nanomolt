@@ -51,6 +51,7 @@ const opencodeAttachUrl =
   process.env.OPENCODE_URL?.replace(/\/$/, "") || "http://127.0.0.1:4096";
 const opencodeAttachMode = process.env.OPENCODE_ATTACH_MODE || "window";
 const opencodeAttachApp = process.env.OPENCODE_ATTACH_APP || "Terminal";
+const bwSession = process.env.BW_SESSION;
 const opencodeHome =
   process.env.OPENCODE_HOME || path.join(process.cwd(), "opencode_home");
 const ghosttyExecFlag = process.env.OPENCODE_GHOSTTY_EXEC_FLAG || "-e";
@@ -93,9 +94,11 @@ type MessageState = {
 
 const messageStates = new Map<string, MessageState>();
 
-function spawnInApp(cmd: string): void {
+function spawnInApp(cmd: string, logCmd?: string): void {
   console.log(
-    `Launching opencode command in ${opencodeAttachApp} (mode=${opencodeAttachMode}): ${cmd}`
+    `Launching opencode command in ${opencodeAttachApp} (mode=${opencodeAttachMode}): ${
+      logCmd ?? cmd
+    }`
   );
   if (process.platform === "win32") {
     const child = spawn("cmd.exe", ["/c", "start", "", "cmd", "/k", cmd], {
@@ -189,12 +192,28 @@ function spawnInApp(cmd: string): void {
   child.unref();
 }
 
+function withBwSession(cmd: string): { cmd: string; logCmd: string } {
+  if (!bwSession) return { cmd, logCmd: cmd };
+  const redacted = cmd.replace(bwSession, "***");
+  if (process.platform === "win32") {
+    return {
+      cmd: `set "BW_SESSION=${bwSession}" && ${cmd}`,
+      logCmd: `set "BW_SESSION=***" && ${redacted}`,
+    };
+  }
+  return {
+    cmd: `BW_SESSION="${bwSession.replace(/"/g, '\\"')}" ${cmd}`,
+    logCmd: `BW_SESSION="***" ${redacted}`,
+  };
+}
+
 function attachOpenCodeSession(sessionId: string): void {
   if (attachedSessions.has(sessionId)) return;
   attachedSessions.add(sessionId);
-  const cmd = `${opencodeBin} attach ${opencodeAttachUrl} --session ${sessionId}`;
+  const baseCmd = `${opencodeBin} attach ${opencodeAttachUrl} --session ${sessionId}`;
+  const { cmd, logCmd } = withBwSession(baseCmd);
   try {
-    spawnInApp(cmd);
+    spawnInApp(cmd, logCmd);
   } catch (err) {
     if (process.platform !== "darwin") {
       console.error("Failed to launch attach via configured mode.", err);
@@ -245,8 +264,9 @@ function startOpenCodeServer(): void {
     console.log(`OpenCode home not found at ${opencodeHome}; skipping opencode serve.`);
     return;
   }
-  const cmd = `cd ${JSON.stringify(opencodeHome)} && ${opencodeBin} serve`;
-  spawnInApp(cmd);
+  const baseCmd = `cd ${JSON.stringify(opencodeHome)} && ${opencodeBin} serve`;
+  const { cmd, logCmd } = withBwSession(baseCmd);
+  spawnInApp(cmd, logCmd);
 }
 
 async function waitForOpenCodeHealthy(): Promise<boolean> {
