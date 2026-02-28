@@ -1,0 +1,16 @@
+{
+  "name": "vibe-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --env-file=.env --watch --experimental-transform-types src/bot.ts",
+    "start": "node --env-file=.env --experimental-transform-types src/bot.ts"
+  },
+  "dependencies": {
+    "grammy": "^1.35.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

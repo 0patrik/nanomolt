@@ -1,0 +1,6 @@
+node_modules
+dist
+.env
+sessions.json
+.claude
+.DS_Store
