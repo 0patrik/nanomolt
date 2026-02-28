@@ -12,7 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import readline from "node:readline";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 
 const token = process.env.BOT_TOKEN;
 if (!token) {
@@ -64,67 +64,6 @@ const attachMaxRetries = 2;
 let opencodeServeStarted = false;
 let attachQueue: Promise<void> = Promise.resolve();
 let opencodeHealthPromise: Promise<boolean> | undefined;
-const opencodeTerminalTitlePrefix = "nanomolt-opencode";
-const spawnedProcessIds: number[] = [];
-
-function registerSpawnedProcess(pid: number | undefined): void {
-  if (!pid || !Number.isFinite(pid)) return;
-  spawnedProcessIds.push(pid);
-}
-
-function cleanupSpawnedProcesses(): void {
-  if (process.platform === "darwin") {
-    const script = `tell application "Terminal"
-  repeat with w in windows
-    if name of w contains "${opencodeTerminalTitlePrefix}" then
-      try
-        close w
-      end try
-    end if
-  end repeat
-end tell`;
-    spawnSync("osascript", ["-e", script], { stdio: "ignore" });
-  }
-
-  if (process.platform === "win32" && spawnedProcessIds.length > 0) {
-    for (const pid of spawnedProcessIds) {
-      spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], { stdio: "ignore" });
-    }
-  }
-
-  if (process.platform !== "darwin" && process.platform !== "win32") {
-    for (const pid of spawnedProcessIds) {
-      try {
-        process.kill(-pid, "SIGTERM");
-      } catch {
-        // ignore
-      }
-    }
-  }
-}
-
-const isDevWatcher =
-  process.execArgv.includes("--watch") || process.env.npm_lifecycle_event === "dev";
-let cleanupDone = false;
-function maybeCleanup(reason: "exit" | "sigint" | "sigterm" | "sighup"): void {
-  if (cleanupDone) return;
-  if (reason === "sigterm" && isDevWatcher) return;
-  cleanupDone = true;
-  cleanupSpawnedProcesses();
-}
-process.on("exit", () => maybeCleanup("exit"));
-process.on("SIGINT", () => {
-  maybeCleanup("sigint");
-  process.exit(0);
-});
-process.on("SIGTERM", () => {
-  maybeCleanup("sigterm");
-  process.exit(0);
-});
-process.on("SIGHUP", () => {
-  maybeCleanup("sighup");
-  process.exit(0);
-});
 
 function isAllowedUserId(userId?: number): boolean {
   return typeof userId === "number" && userId === allowedUserId;
@@ -154,61 +93,25 @@ type MessageState = {
 
 const messageStates = new Map<string, MessageState>();
 
-function terminalWindowExists(title: string): boolean {
-  const escapedTitle = title.replace(/"/g, '\\"');
-  const script = `tell application "Terminal"
-  count (windows whose name contains "${escapedTitle}")
-end tell`;
-  const result = spawnSync("osascript", ["-e", script], { encoding: "utf8" });
-  const count = Number(result.stdout?.trim() ?? "0");
-  return Number.isFinite(count) && count > 0;
-}
-
-function decorateCommand(cmd: string, title?: string): string {
-  if (!title) return cmd;
-  const escaped = title
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .replace(/\$/g, "\\$")
-    .replace(/`/g, "\\`");
-  return `printf "\\e]0;${escaped}\\a"; ${cmd}`;
-}
-
-function spawnInApp(cmd: string, title?: string): void {
+function spawnInApp(cmd: string): void {
   console.log(
     `Launching opencode command in ${opencodeAttachApp} (mode=${opencodeAttachMode}): ${cmd}`
   );
   if (process.platform === "win32") {
-    const winTitle = title ? `title "${title.replace(/"/g, '""')}" & ` : "";
-    const winCmd = `${winTitle}${cmd}`;
-    const ps = `"$p=Start-Process -FilePath 'cmd.exe' -ArgumentList '/k','${winCmd.replace(
-      /'/g,
-      "''"
-    )}' -PassThru; $p.Id"`;
-    const child = spawn("powershell.exe", ["-NoProfile", "-Command", ps], {
-      stdio: ["ignore", "pipe", "ignore"],
-      detached: false,
+    const child = spawn("cmd.exe", ["/c", "start", "", "cmd", "/k", cmd], {
+      stdio: "ignore",
+      detached: true,
       windowsHide: true,
-    });
-    let output = "";
-    child.stdout?.on("data", (chunk) => {
-      output += chunk.toString();
-    });
-    child.on("close", () => {
-      const pid = Number(output.trim());
-      if (Number.isFinite(pid)) {
-        registerSpawnedProcess(pid);
-      }
     });
     child.on("error", (err) => {
       console.error("Failed to launch Windows terminal:", err);
     });
+    child.unref();
     return;
   }
 
   if (process.platform !== "darwin") {
-    const titledCmd = decorateCommand(cmd, title);
-    const child = spawn(titledCmd, {
+    const child = spawn(cmd, {
       stdio: "ignore",
       detached: true,
       shell: true,
@@ -217,13 +120,11 @@ function spawnInApp(cmd: string, title?: string): void {
       console.error("Failed to launch terminal command:", err);
     });
     child.unref();
-    registerSpawnedProcess(child.pid);
     return;
   }
 
   if (opencodeAttachMode === "open") {
-    const titledCmd = decorateCommand(cmd, title);
-    const child = spawn("open", ["-a", opencodeAttachApp, "--args", ghosttyExecFlag, titledCmd], {
+    const child = spawn("open", ["-a", opencodeAttachApp, "--args", ghosttyExecFlag, cmd], {
       stdio: "ignore",
       detached: true,
     });
@@ -235,10 +136,9 @@ function spawnInApp(cmd: string, title?: string): void {
   }
 
   if (opencodeAttachMode === "tab" && opencodeAttachApp === "Ghostty") {
-    const titledCmd = decorateCommand(cmd, title);
     const child = spawn(
       "open",
-      ["-a", opencodeAttachApp, "--args", ghosttyTabFlag, ghosttyExecFlag, titledCmd],
+      ["-a", opencodeAttachApp, "--args", ghosttyTabFlag, ghosttyExecFlag, cmd],
       {
         stdio: "ignore",
         detached: true,
@@ -251,13 +151,7 @@ function spawnInApp(cmd: string, title?: string): void {
     return;
   }
 
-  if (opencodeAttachApp === "Terminal" && title && terminalWindowExists(title)) {
-    console.log(`Terminal window already open for ${title}; skipping spawn.`);
-    return;
-  }
-
-  const titledCmd = decorateCommand(cmd, title);
-  const escaped = titledCmd.replace(/"/g, '\\"');
+  const escaped = cmd.replace(/"/g, '\\"');
   const script =
     opencodeAttachMode === "tab" && opencodeAttachApp === "Terminal"
       ? `tell application "Terminal"
@@ -272,18 +166,27 @@ function spawnInApp(cmd: string, title?: string): void {
         ? `tell application "${opencodeAttachApp}" to do script "${escaped}" in front window`
         : opencodeAttachApp === "Terminal"
           ? `tell application "Terminal"
-        set newTab to do script "${escaped}"
-        set newWindow to window of newTab
-        return id of newWindow
+        if (count of windows) = 0 then
+          do script "${escaped}"
+        else
+          set frontWindow to window 1
+          set frontTab to selected tab of frontWindow
+          if busy of frontTab is false then
+            do script "${escaped}" in frontWindow
+          else
+            do script "${escaped}"
+          end if
+        end if
       end tell`
           : `tell application "${opencodeAttachApp}" to do script "${escaped}"`;
   const child = spawn("osascript", ["-e", script], {
-    stdio: ["ignore", "pipe", "ignore"],
-    detached: false,
+    stdio: "ignore",
+    detached: true,
   });
   child.on("error", (err) => {
     console.error("Failed to launch via osascript:", err);
   });
+  child.unref();
 }
 
 function attachOpenCodeSession(sessionId: string): void {
@@ -291,7 +194,7 @@ function attachOpenCodeSession(sessionId: string): void {
   attachedSessions.add(sessionId);
   const cmd = `${opencodeBin} attach ${opencodeAttachUrl} --session ${sessionId}`;
   try {
-    spawnInApp(cmd, `${opencodeTerminalTitlePrefix}-attach-${sessionId}`);
+    spawnInApp(cmd);
   } catch (err) {
     if (process.platform !== "darwin") {
       console.error("Failed to launch attach via configured mode.", err);
@@ -343,7 +246,7 @@ function startOpenCodeServer(): void {
     return;
   }
   const cmd = `cd ${JSON.stringify(opencodeHome)} && ${opencodeBin} serve`;
-  spawnInApp(cmd, `${opencodeTerminalTitlePrefix}-serve`);
+  spawnInApp(cmd);
 }
 
 async function waitForOpenCodeHealthy(): Promise<boolean> {
@@ -359,20 +262,6 @@ async function waitForOpenCodeHealthy(): Promise<boolean> {
     await new Promise((resolve) => setTimeout(resolve, opencodeHealthIntervalMs));
   }
   return false;
-}
-
-async function checkOpenCodeHealthyOnce(timeoutMs = 1000): Promise<boolean> {
-  const url = `${opencodeAttachUrl}${opencodeHealthPath}`;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    return res.ok;
-  } catch {
-    return false;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 async function attachSessionsSequentially(sessionIds: string[]): Promise<void> {
@@ -1330,12 +1219,8 @@ try {
   process.exit(1);
 }
 
-const alreadyHealthy = await checkOpenCodeHealthyOnce();
-if (!alreadyHealthy) {
-  startOpenCodeServer();
-}
-opencodeHealthPromise = (alreadyHealthy ? Promise.resolve(true) : waitForOpenCodeHealthy()).then(
-  (isHealthy) => {
+startOpenCodeServer();
+opencodeHealthPromise = waitForOpenCodeHealthy().then((isHealthy) => {
   if (!isHealthy) {
     console.error("OpenCode server did not become healthy in time; skipping session attaches.");
   }
