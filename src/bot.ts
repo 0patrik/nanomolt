@@ -97,6 +97,32 @@ function spawnInApp(cmd: string): void {
   console.log(
     `Launching opencode command in ${opencodeAttachApp} (mode=${opencodeAttachMode}): ${cmd}`
   );
+  if (process.platform === "win32") {
+    const child = spawn("cmd.exe", ["/c", "start", "", "cmd", "/k", cmd], {
+      stdio: "ignore",
+      detached: true,
+      windowsHide: true,
+    });
+    child.on("error", (err) => {
+      console.error("Failed to launch Windows terminal:", err);
+    });
+    child.unref();
+    return;
+  }
+
+  if (process.platform !== "darwin") {
+    const child = spawn(cmd, {
+      stdio: "ignore",
+      detached: true,
+      shell: true,
+    });
+    child.on("error", (err) => {
+      console.error("Failed to launch terminal command:", err);
+    });
+    child.unref();
+    return;
+  }
+
   if (opencodeAttachMode === "open") {
     const child = spawn("open", ["-a", opencodeAttachApp, "--args", ghosttyExecFlag, cmd], {
       stdio: "ignore",
@@ -170,7 +196,14 @@ function attachOpenCodeSession(sessionId: string): void {
   try {
     spawnInApp(cmd);
   } catch (err) {
-    console.error("Failed to launch attach via configured mode; falling back to Terminal window.", err);
+    if (process.platform !== "darwin") {
+      console.error("Failed to launch attach via configured mode.", err);
+      return;
+    }
+    console.error(
+      "Failed to launch attach via configured mode; falling back to Terminal window.",
+      err
+    );
     const fallbackScript = `tell application "Terminal"
       activate
       do script "${cmd.replace(/"/g, '\\"')}"
